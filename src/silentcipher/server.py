@@ -12,17 +12,18 @@ import librosa
 from pydub import AudioSegment
 import torch
 from torch import nn
+import torchaudio
 
 from .model import Encoder, CarrierDecoder, MsgDecoder
 from .stft import STFT
 
 class Model():
-    
+
     def __init__(self, config, device='cpu'):
-         
+
         self.config = config
         self.device = device
-        
+
         self.n_messages = config.n_messages
         self.model_type = config.model_type
         self.message_dim = config.message_dim
@@ -36,7 +37,7 @@ class Model():
         self.dec_m_num_repeat = 8
         self.encoder_out_dim = 32
         self.dec_c_conv_dim = 32*3
-            
+
         self.enc_c = Encoder(n_layers=self.config.enc_n_layers,
                              message_dim=self.message_dim,
                              out_dim=self.encoder_out_dim,
@@ -54,7 +55,7 @@ class Model():
         self.enc_c = self.enc_c.to(self.device)
         self.dec_c = self.dec_c.to(self.device)
         self.dec_m = [m.to(self.device) for m in self.dec_m]
-        
+
         self.average_energy_VCTK=0.002837200844477648
         self.stft = STFT(self.config.N_FFT, self.config.HOP_LENGTH)
         self.stft.to(self.device)
@@ -78,7 +79,7 @@ class Model():
         Raises:
             AssertionError: If the length of any message in message_lst is not equal to self.config.message_len - 1.
         """
-         
+
         message = []
         message_compact = []
         for i in range(self.n_messages):
@@ -97,7 +98,7 @@ class Model():
         message_compact = np.stack(message_compact)
         # message = np.pad(message, ((0, 0), (0, 129 - self.message_dim), (0, 0)), 'constant')
         return message, message_compact
-    
+
     def get_best_ps(self, y_one_sec):
 
         """
@@ -110,14 +111,14 @@ class Model():
             int: The best phase shift value.
 
         """
-        
+
         def check_accuracy(pred_values):
-        
+
             accuracy = 0
             for i in range(pred_values.shape[1]):
                 unique, counts = np.unique(pred_values[:, i], return_counts=True)
                 accuracy += np.max(counts) / pred_values.shape[0]
-            
+
             return accuracy / pred_values.shape[1]
 
         y = torch.FloatTensor(y_one_sec).unsqueeze(0).unsqueeze(0).to(self.device)
@@ -140,7 +141,7 @@ class Model():
                     final_phase_shift = ps
 
         return final_phase_shift
-    
+
     def get_confidence(self, pred_values, message):
         """
         Calculates the confidence of the predicted values based on the provided message.
@@ -158,7 +159,7 @@ class Model():
         """
         assert len(message) == pred_values.shape[1], f'{len(message)} | {pred_values.shape}'
         return np.mean((pred_values == message[None]).astype(np.float32)).item()
-    
+
     def sdr(self, orig, recon):
         """
         Calculate the Signal-to-Distortion Ratio (SDR) between the original and reconstructed signals.
@@ -222,7 +223,7 @@ class Model():
             return {'status': True, 'sdr': [f'{sdr_i:.2f}' for sdr_i in sdr], 'time_taken': time_taken, 'time_taken_per_second': time_taken / (y.shape[0] / orig_sr)}
         else:
             return {'status': True, 'sdr': f'{sdr:.2f}', 'time_taken': time_taken, 'time_taken_per_second': time_taken / (y.shape[0] / orig_sr)}
-    
+
     def decode(self, path, phase_shift_decoding):
         """
         Decode the audio file at the given path using phase shift decoding.
@@ -234,18 +235,17 @@ class Model():
         Returns:
         dictionary: A dictionary containing the decoded message status and value
         """
-        
+
         y, orig_sr = self.load_audio(path)
 
         return self.decode_wav(y, orig_sr, phase_shift_decoding)
-    
-    def encode_wav(self, y_multi_channel, orig_sr, message_list, message_sdr=None, calc_sdr=True, disable_checks=False):
 
+    def encode_wav(self, y_multi_channel, orig_sr, message_list, message_sdr=None, calc_sdr=True, disable_checks=False):
         """
         Encodes a multi-channel audio waveform with a given message.
 
         Args:
-            y_multi_channel (numpy.ndarray): The multi-channel audio waveform to be encoded.
+            y_multi_channel (torch.Tensor): The multi-channel audio waveform to be encoded.
             orig_sr (int): The original sampling rate of the audio waveform.
             message_list (list): The list of messages to be encoded. Each message may correspond to a channel in the audio waveform.
             message_sdr (float, optional): The signal-to-distortion ratio (SDR) of the message. If not provided, the default SDR from the configuration is used.
@@ -258,44 +258,48 @@ class Model():
         Raises:
             AssertionError: If the number of messages does not match the number of channels in the input audio waveform.
         """
-        
+
+        # Convert input to torch tensor if not already
+        if not isinstance(y_multi_channel, torch.Tensor):
+            y_multi_channel = torch.tensor(y_multi_channel, dtype=torch.float32)
+
         single_channel = False
         if len(y_multi_channel.shape) == 1:
             single_channel = True
-            y_multi_channel = y_multi_channel[:, None]
+            y_multi_channel = y_multi_channel.unsqueeze(1)
 
         if message_sdr is None:
             message_sdr = self.config.message_sdr
             print(f'Using the default SDR of {self.config.message_sdr} dB')
 
-        if type(message_list[0]) == int:
-            message_list = [message_list]*y_multi_channel.shape[1]
+        if isinstance(message_list[0], int):
+            message_list = [message_list] * y_multi_channel.shape[1]
 
         y_watermarked_multi_channel = []
         sdrs = []
 
         assert len(message_list) == y_multi_channel.shape[1], f'{len(message_list)} | {y_multi_channel.shape[1]} Mismatch in the number of messages and channels in the input audio.'
-        
+
         for channel_i in range(y_multi_channel.shape[1]):
             y = y_multi_channel[:, channel_i]
             message = message_list[channel_i]
 
             with torch.no_grad():
-
-                orig_y = y.copy()
+                orig_y = y.clone()
                 if orig_sr != self.sr:
                     if orig_sr > self.sr:
                         print(f'WARNING! Reducing the sampling rate of the original audio from {orig_sr} -> {self.sr}. High frequency components may be lost!')
-                    y = librosa.resample(y, orig_sr = orig_sr, target_sr = self.sr)
-                original_power = np.mean(y**2)
+                    y = torchaudio.functional.resample(y.view(1, -1), orig_freq=orig_sr, new_freq=self.sr).squeeze()
+
+                original_power = torch.mean(y**2)
 
                 if not disable_checks:
                     if original_power == 0:
-                        print('WARNING! The input audio has a power of 0.This means the audio is likely just silence. Skipping encoding.')
+                        print('WARNING! The input audio has a power of 0. This means the audio is likely just silence. Skipping encoding.')
                         return orig_y, 0
 
-                y = y * np.sqrt(self.average_energy_VCTK / original_power)  # Noise has a power of 5% power of VCTK samples
-                y = torch.FloatTensor(y).unsqueeze(0).unsqueeze(0).to(self.device)
+                y = y * torch.sqrt(torch.tensor(self.average_energy_VCTK, device=self.device) / original_power)
+                y = y.unsqueeze(0).unsqueeze(0).to(self.device)
                 carrier, carrier_phase = self.stft.transform(y.squeeze(1))
                 carrier = carrier[:, None]
                 carrier_phase = carrier_phase[:, None]
@@ -306,23 +310,23 @@ class Model():
                     for i in range(len(binary_message)//2):
                         four_bit_msg.append(int(binary_message[i*2:i*2+2], 2))
                     return four_bit_msg
-                
+
                 binary_encoded_message = binary_encode(message)
 
                 msgs, msgs_compact = self.letters_encoding(carrier.shape[3], [binary_encoded_message])
-                msg_enc = torch.from_numpy(msgs[None]).to(self.device).float()
+                msg_enc = torch.tensor(msgs, device=self.device).unsqueeze(0).float()
 
                 carrier_enc = self.enc_c(carrier)  # encode the carrier
                 msg_enc = self.enc_c.transform_message(msg_enc)
 
-                merged_enc = torch.cat((carrier_enc, carrier.repeat(1, 32, 1, 1), msg_enc.repeat(1, 32, 1, 1)), dim=1)  # concat encodings on features axis
-                
+                merged_enc = torch.cat((carrier_enc, carrier.repeat(1, 32, 1, 1), msg_enc.repeat(1, 32, 1, 1)), dim=1)
+
                 message_info = self.dec_c(merged_enc, message_sdr)
                 if self.config.frame_level_normalization:
-                    message_info = message_info*(torch.mean((carrier**2), dim=2, keepdim=True)**0.5)  # *time_weighing
+                    message_info = message_info * (torch.mean(carrier**2, dim=2, keepdim=True)**0.5)  # *time_weighing
                 elif self.config.utterance_level_normalization:
-                    message_info = message_info*(torch.mean((carrier**2), dim=(2,3), keepdim=True)**0.5)  # *time_weighing
-                
+                    message_info = message_info * (torch.mean(carrier**2, dim=(2,3), keepdim=True)**0.5)  # *time_weighing
+
                 if self.config.ensure_negative_message:
                     message_info = -message_info
                     carrier_reconst = torch.nn.functional.relu(message_info + carrier)  # decode carrier, output in stft domain
@@ -336,33 +340,38 @@ class Model():
 
                 self.stft.num_samples = y.shape[2]
 
-                y = self.stft.inverse(carrier_reconst.squeeze(1), carrier_phase.squeeze(1)).data.cpu().numpy()[0, 0]
-                y = y * np.sqrt(original_power / (self.average_energy_VCTK))  # Noise has a power of 5% power of VCTK samples
+                y = self.stft.inverse(carrier_reconst.squeeze(1), carrier_phase.squeeze(1))[0, 0]
+                y = y * torch.sqrt(original_power / torch.tensor(self.average_energy_VCTK, device=self.device))  # Noise has a power of 5% power of VCTK samples
+
                 if orig_sr != self.sr:
-                    y = librosa.resample(y, orig_sr = self.sr, target_sr = orig_sr)
+                    y = torchaudio.functional.resample(y.view(1, -1), orig_freq=self.sr, new_freq=orig_sr).squeeze()
+
+                    # Sometimes resampling leads to off-by-one sequence length errors
+                    seq_len = y_multi_channel.shape[0]
+                    y = y[:seq_len]
 
                 if calc_sdr:
                     sdr = self.sdr(orig_y, y)
                 else:
                     sdr = 0
 
-            y_watermarked_multi_channel.append(y[:, None])
+            y_watermarked_multi_channel.append(y.unsqueeze(1))
             sdrs.append(sdr)
-        
-        y_watermarked_multi_channel = np.concatenate(y_watermarked_multi_channel, axis=1)
+
+        y_watermarked_multi_channel = torch.cat(y_watermarked_multi_channel, dim=1)
 
         if single_channel:
             y_watermarked_multi_channel = y_watermarked_multi_channel[:, 0]
             sdrs = sdrs[0]
-        
+
         return y_watermarked_multi_channel, sdrs
-    
+
     def decode_wav(self, y_multi_channel, orig_sr, phase_shift_decoding):
         """
         Decode the given audio waveform to extract hidden messages.
 
         Args:
-            y_multi_channel (numpy.ndarray): The multi-channel audio waveform.
+            y_multi_channel (torch.Tensor): The multi-channel audio waveform.
             orig_sr (int): The original sample rate of the audio waveform.
             phase_shift_decoding (str): Flag indicating whether to perform phase shift decoding.
 
@@ -374,26 +383,34 @@ class Model():
             Exception: If the decoding process fails.
 
         """
+
+        # Convert input to torch tensor if not already
+        if not isinstance(y_multi_channel, torch.Tensor):
+            y_multi_channel = torch.tensor(y_multi_channel, dtype=torch.float32)
+
         single_channel = False
         if len(y_multi_channel.shape) == 1:
             single_channel = True
-            y_multi_channel = y_multi_channel[:, None]
-        
+            y_multi_channel = y_multi_channel.unsqueeze(1)
+
         results = []
-        
+
         for channel_i in range(y_multi_channel.shape[1]):
             y = y_multi_channel[:, channel_i]
             try:
                 with torch.no_grad():
                     if orig_sr != self.sr:
-                        y = librosa.resample(y, orig_sr = orig_sr, target_sr = self.sr)
-                    original_power = np.mean(y**2)
-                    y = y * np.sqrt(self.average_energy_VCTK / original_power)  # Noise has a power of 5% power of VCTK samples
+                        y = torchaudio.functional.resample(y.view(1, -1), orig_freq=orig_sr, new_freq=self.sr).squeeze()
+
+                    original_power = torch.mean(y**2)
+                    y = y * torch.sqrt(torch.tensor(self.average_energy_VCTK) / original_power)  # Noise has a power of 5% power of VCTK samples
+
                     if phase_shift_decoding and phase_shift_decoding != 'false':
                         ps = self.get_best_ps(y)
                     else:
                         ps = 0
-                    y = torch.FloatTensor(y[ps:]).unsqueeze(0).unsqueeze(0).to(self.device)
+
+                    y = y[ps:].unsqueeze(0).unsqueeze(0).to(self.device)
                     carrier, _ = self.stft.transform(y.squeeze(1))
                     carrier = carrier[:, None]
 
@@ -409,6 +426,7 @@ class Model():
                         ord_values = st.mode(pred_values, keepdims=False).mode
                         end_char = np.min(np.nonzero(ord_values == 0)[0])
                         confidence.append(self.get_confidence(pred_values, ord_values))
+
                         if end_char == self.config.message_len:
                             ord_values = ord_values[:self.config.message_len-1]
                         else:
@@ -416,25 +434,26 @@ class Model():
 
                         # pred_values = ''.join([chr(v + 64) for v in ord_values])
                         msg_reconst_list.append((ord_values - 1).tolist())
-                    
+
                     def convert_to_8_bit_segments(msg_list):
                         segment_message_list = []
                         for msg_list_i in msg_list:
-                            binary_format = ''.join(['{0:02b}'.format(mes_i) for mes_i in msg_list_i])
+                            binary_format = ''.join([f'{mes_i:02b}' for mes_i in msg_list_i])
                             eight_bit_segments = [int(binary_format[i*8:i*8+8], 2) for i in range(len(binary_format)//8)]
                             segment_message_list.append(eight_bit_segments)
                         return segment_message_list
+
                     msg_reconst_list = convert_to_8_bit_segments(msg_reconst_list)
-                
+
                 results.append({'messages': msg_reconst_list, 'confidences': confidence, 'status': True})
             except:
                 results.append({'messages': [], 'confidences': [], 'error': 'Could not find message', 'status': False})
 
         if single_channel:
             results = results[0]
-        
+
         return results
-    
+
     def convert_dataparallel_to_normal(self, checkpoint):
 
         return {i[len('module.'):] if i.startswith('module.') else i: checkpoint[i] for i in checkpoint }
@@ -476,5 +495,5 @@ def get_model(model_type='44.1k', ckpt_path='../Models/44_1_khz/73999_iteration'
         model = Model(config, device)
     else:
         print('Please specify a valid model_type [44.1k, 16k]')
-    
+
     return model
