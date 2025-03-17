@@ -314,7 +314,7 @@ class Model():
                 binary_encoded_message = binary_encode(message)
 
                 msgs, msgs_compact = self.letters_encoding(carrier.shape[3], [binary_encoded_message])
-                msg_enc = torch.tensor(msgs, dtype=torch.float32, device=self.device).unsqueeze(0)
+                msg_enc = torch.tensor(msgs, device=self.device, dtype=torch.float32).unsqueeze(0)
 
                 carrier_enc = self.enc_c(carrier)  # encode the carrier
                 msg_enc = self.enc_c.transform_message(msg_enc)
